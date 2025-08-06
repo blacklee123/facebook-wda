@@ -17,7 +17,7 @@ import subprocess
 import threading
 import time
 from collections import defaultdict, namedtuple
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, Dict, NamedTuple
 from urllib.parse import urlparse
 
 import retry
@@ -58,6 +58,16 @@ PORTRAIT = 'PORTRAIT'
 LANDSCAPE_RIGHT = 'UIA_DEVICE_ORIENTATION_LANDSCAPERIGHT'
 PORTRAIT_UPSIDEDOWN = 'UIA_DEVICE_ORIENTATION_PORTRAIT_UPSIDEDOWN'
 
+class HTTPRequest(NamedTuple):
+    fetch: Callable[..., AttrDict]
+    get: Callable[[str, Optional[Dict], Optional[float]], AttrDict]
+    post: Callable[[str, Optional[Dict], Optional[float]], AttrDict]
+
+class HTTPSessionRequest(NamedTuple):
+    fetch: Callable[..., AttrDict]
+    get: Callable[[str, Optional[Dict], Optional[float]], AttrDict]
+    post: Callable[[str, Optional[Dict], Optional[float]], AttrDict]
+    delete: Callable[[str, Optional[Dict], Optional[float]], AttrDict]
 
 class Status(enum.IntEnum):
     # 不是怎么准确，status在mds平台上变来变去的
@@ -400,19 +410,19 @@ class BaseClient(object):
                 raise
 
     @property
-    def http(self):
-        return namedtuple("HTTPRequest", ['fetch', 'get', 'post'])(
+    def http(self) -> HTTPRequest:
+        return HTTPRequest(
             self._fetch,
             functools.partial(self._fetch, "GET"),
-            functools.partial(self._fetch, "POST"))  # yapf: disable
+            functools.partial(self._fetch, "POST"))
 
     @property
-    def _session_http(self):
-        return namedtuple("HTTPSessionRequest", ['fetch', 'get', 'post', 'delete'])(
+    def _session_http(self) -> HTTPRequest:
+        return HTTPSessionRequest(
             functools.partial(self._fetch, with_session=True),
             functools.partial(self._fetch, "GET", with_session=True),
             functools.partial(self._fetch, "POST", with_session=True),
-            functools.partial(self._fetch, "DELETE", with_session=True))  # yapf: disable
+            functools.partial(self._fetch, "DELETE", with_session=True))
 
     def home(self):
         """Press home button"""
@@ -717,7 +727,7 @@ class BaseClient(object):
         """
         pass
 
-    def get_clipboard(self, wda_bundle_id):
+    def get_clipboard(self, wda_bundle_id="com.facebook.WebDriverAgentRunner.xctrunner"):
         """ Get clipboard text.
 
         If you want to use this function, you have to set wda foreground which would switch the 
@@ -730,19 +740,15 @@ class BaseClient(object):
             Clipboard text.
         """
         current_app_bundle_id = self.app_current().get("bundleId", "")
-        # Set wda foreground, it's necessary.
-        try:
-            self.app_launch(wda_bundle_id)
-        except:
-            pass
+        self.siri_activate("open WebDriverAgentRunner-Runner")
+        time.sleep(3)
         clipboard_text = self._session_http.post("/wda/getPasteboard").value
         # Switch back to the screen before.
         self.app_launch(current_app_bundle_id)
         return base64.b64decode(clipboard_text).decode('utf-8')
     
-    # Not working
-    # def siri_activate(self, text):
-    #    self.http.post("/wda/siri/activate", {"text": text})
+    def siri_activate(self, text):
+        self._session_http.post("/wda/siri/activate", {"text": text})
 
     def app_launch(self,
                    bundle_id,

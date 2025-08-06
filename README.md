@@ -239,8 +239,19 @@ s.locked() # locked status, true or false
 s.battery_info() # return like {"level": 1, "state": 2}
 s.device_info() # return like {"currentLocale": "zh_CN", "timeZone": "Asia/Shanghai"}
 
-s.set_clipboard("Hello world") # update clipboard
-# s.get_clipboard() # Not working now
+s.siri_activate("How's the weather today") #activate siri
+
+# update clipboard
+text = "Hello world"
+s.siri_activate("open WebDriverAgentRunner-Runner")
+import time
+time.sleep(3)
+s.set_clipboard(text)
+
+# get clipboard
+copyed = s.get_clipboard()
+
+print(f"text == copyed: {text == copyed}")
 
 # Screenshot return PIL.Image
 # Requires pillow, installed by "pip install pillow"
