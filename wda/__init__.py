@@ -1,8 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-from __future__ import print_function, unicode_literals
-
 import base64
 import contextlib
 import enum
@@ -21,21 +19,10 @@ from typing import Callable, Optional, Union
 from urllib.parse import urlparse
 
 import retry
-import six
-from deprecated import deprecated
 
-from wda import xcui_element_types
-from wda._proto import *
 from wda.exceptions import *
 from wda.usbmux import fetch
-from wda.usbmux.pyusbmux import list_devices, select_device
 from wda.utils import inject_call, limit_call_depth, AttrDict, convert
-
-
-try:
-    from functools import cached_property  # Python3.8+
-except ImportError:
-    from cached_property import cached_property
 
 try:
     import sys
@@ -57,6 +44,99 @@ LANDSCAPE = 'LANDSCAPE'
 PORTRAIT = 'PORTRAIT'
 LANDSCAPE_RIGHT = 'UIA_DEVICE_ORIENTATION_LANDSCAPERIGHT'
 PORTRAIT_UPSIDEDOWN = 'UIA_DEVICE_ORIENTATION_PORTRAIT_UPSIDEDOWN'
+
+ELEMENTS = [
+    'Any',
+    'Other',
+    'Application',
+    'Group',
+    'Window',
+    'Sheet',
+    'Drawer',
+    'Alert',
+    'Dialog',
+    'Button',
+    'RadioButton',
+    'RadioGroup',
+    'CheckBox',
+    'DisclosureTriangle',
+    'PopUpButton',
+    'ComboBox',
+    'MenuButton',
+    'ToolbarButton',
+    'Popover',
+    'Keyboard',
+    'Key',
+    'NavigationBar',
+    'TabBar',
+    'TabGroup',
+    'Toolbar',
+    'StatusBar',
+    'Table',
+    'TableRow',
+    'TableColumn',
+    'Outline',
+    'OutlineRow',
+    'Browser',
+    'CollectionView',
+    'Slider',
+    'PageIndicator',
+    'ProgressIndicator',
+    'ActivityIndicator',
+    'SegmentedControl',
+    'Picker',
+    'PickerWheel',
+    'Switch',
+    'Toggle',
+    'Link',
+    'Image',
+    'Icon',
+    'SearchField',
+    'ScrollView',
+    'ScrollBar',
+    'StaticText',
+    'TextField',
+    'SecureTextField',
+    'DatePicker',
+    'TextView',
+    'Menu',
+    'MenuItem',
+    'MenuBar',
+    'MenuBarItem',
+    'Map',
+    'WebView',
+    'IncrementArrow',
+    'DecrementArrow',
+    'Timeline',
+    'RatingIndicator',
+    'ValueIndicator',
+    'SplitGroup',
+    'Splitter',
+    'RelevanceIndicator',
+    'ColorWell',
+    'HelpTag',
+    'Matte',
+    'DockItem',
+    'Ruler',
+    'RulerMarker',
+    'Grid',
+    'LevelIndicator',
+    'Cell',
+    'LayoutArea',
+    'LayoutItem',
+    'Handle',
+    'Stepper',
+    'Tab'
+]
+
+
+# default_alert_accept_selector = "**/XCUIElementTypeButton[`label IN {'允许','好','仅在使用应用期间','暂不'}`]"
+# default_alert_dismiss_selector = "**/XCUIElementTypeButton[`label IN {'不允许','暂不'}`]"
+
+
+class AlertAction(str, enum.Enum):
+    ACCEPT = "accept"
+    DISMISS = "dismiss"
 
 
 class Status(enum.IntEnum):
@@ -200,26 +280,6 @@ class Rect(list):
     @property
     def bottom(self):
         return self.y + self.height
-
-
-def _start_wda_xctest(udid: str, wda_bundle_id=None) -> bool:
-    xctool_path = shutil.which("tins2") or shutil.which("tidevice")
-    if not xctool_path:
-        return False
-    logger.info("WDA is not running, exec: {} xctest".format(xctool_path))
-    args = []
-    if udid:
-        args.extend(['-u', udid])
-    args.append('xctest')
-    if wda_bundle_id:
-        args.extend(['-B', wda_bundle_id])
-    p = subprocess.Popen([xctool_path] + args)
-    time.sleep(3)
-    if p.poll() is not None:
-        logger.warning("xctest launch failed")
-        return False
-    return True
-
 
 class BaseClient(object):
     def __init__(self, url=None, _session_id=None):
@@ -617,11 +677,6 @@ class BaseClient(object):
         self.close()
 
     @property
-    @deprecated(version="1.0.0", reason="Use session_id instread id")
-    def id(self):
-        return self._get_session_id()
-
-    @property
     def session_id(self) -> str:
         if self.__session_id:
             return self.__session_id
@@ -638,7 +693,7 @@ class BaseClient(object):
     def _get_session_id(self) -> str:
         return self.session_id
 
-    @cached_property
+    @functools.cached_property
     def scale(self) -> int:
         """
         UIKit scale factor
@@ -654,7 +709,7 @@ class BaseClient(object):
             v = max(self.screenshot().size) / max(self.window_size())
             return round(v)
 
-    @cached_property
+    @functools.cached_property
     def bundle_id(self):
         """ the session matched bundle id """
         v = self._session_http.get("/").value
@@ -703,19 +758,6 @@ class BaseClient(object):
                 "content": base64.b64encode(content.encode()).decode(),
                 "contentType": content_type
             })
-
-    @deprecated(version="1.0.0", reason="This method is deprecated now.")
-    def set_alert_callback(self, callback):
-        """
-        Args:
-            callback (func): called when alert popup
-
-        Example of callback:
-
-            def callback(session):
-                session.alert.accept()
-        """
-        pass
 
     def get_clipboard(self, wda_bundle_id):
         """ Get clipboard text.
@@ -1007,7 +1049,7 @@ class BaseClient(object):
         """
         send keys, yet I know not, todo function
         """
-        if isinstance(value, six.string_types):
+        if isinstance(value, str):
             value = list(value)
         return self._session_http.post('/wda/keys', data={'value': value})
 
@@ -1080,7 +1122,7 @@ class BaseClient(object):
             kwargs['timeout'] = self.__timeout
         return Selector(self, *args, **kwargs)
 
-    @cached_property
+    @functools.cached_property
     def alibaba(self):
         """ Only used in alibaba company """
         try:
@@ -1090,7 +1132,7 @@ class BaseClient(object):
             raise RuntimeError(
                 "@alibaba property requires wda_taobao library installed")
 
-    @cached_property
+    @functools.cached_property
     def taobao(self):
         try:
             import wda_taobao
@@ -1349,7 +1391,7 @@ class Selector(object):
     def _fix_xcui_type(self, s):
         if s is None:
             return
-        re_element = '|'.join(xcui_element_types.ELEMENTS)
+        re_element = '|'.join(ELEMENTS)
         return re.sub(r'/(' + re_element + ')', '/XCUIElementType\g<1>', s)
 
     def _add_escape_character_for_quote_prime_character(self, text):
@@ -1760,24 +1802,3 @@ class Element(object):
         Returns: bool
         '''
         return self._req('GET', '/selected').value
-
-
-class USBClient(Client):
-    """ connect device through unix:/var/run/usbmuxd """
-
-    def __init__(self, udid: str = "", port: int = 8100, wda_bundle_id=None):
-        if not udid:
-            infos = [info for info in list_devices() if info.connection_type == 'USB']
-            if len(infos) == 0:
-                raise RuntimeError("no device connected")
-            elif len(infos) >= 2:
-                raise RuntimeError("more then one device connected")
-            udid = infos[0].serial
-
-        super().__init__(url=f"http+usbmux://{udid}:{port}")
-        if self.is_ready():
-            return
-
-        _start_wda_xctest(udid, wda_bundle_id)
-        if not self.wait_ready(timeout=20):
-            raise RuntimeError("wda xctest launched but check failed")
