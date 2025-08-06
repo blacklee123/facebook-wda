@@ -1,3 +1,4 @@
 retry
 Pillow
 construct>=2
+requests

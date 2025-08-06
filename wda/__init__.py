@@ -3,21 +3,20 @@ import contextlib
 import enum
 import functools
 import io
-import json
 import logging
 import os
 import re
 import threading
 import time
 from collections import defaultdict, namedtuple
-from typing import Callable, Optional, Union
-from urllib.parse import urlparse
+from typing import Optional, Union
+from urllib.parse import urlparse, urljoin
+import requests
 
 import retry
 
 from wda import exceptions
-from wda.usbmux import fetch
-from wda.utils import inject_call, limit_call_depth, AttrDict, convert
+from wda.utils import limit_call_depth, AttrDict, convert
 
 try:
     import sys
@@ -153,18 +152,6 @@ class Callback(str, enum.Enum):
     # return namedtuple('GenericDict', list(dictionary.keys()))(**dictionary)
 
 
-def urljoin(*urls):
-    """
-    The default urlparse.urljoin behavior look strange
-    Standard urlparse.urljoin('http://a.com/foo', '/bar')
-    Expect: http://a.com/foo/bar
-    Actually: http://a.com/bar
-
-    This function fix that.
-    """
-    return '/'.join([u.strip("/") for u in urls])
-
-
 def roundint(i):
     return int(round(i, 0))
 
@@ -177,66 +164,6 @@ def namedlock(name):
     if not hasattr(namedlock, 'locks'):
         namedlock.locks = defaultdict(threading.Lock)
     return namedlock.locks[name]
-
-
-def httpdo(url, method="GET", data=None, timeout=None) -> AttrDict:
-    """
-    thread safe http request
-
-    Raises:
-        WDAError, WDARequestError, WDAEmptyResponseError
-    """
-    p = urlparse(url)
-    with namedlock(p.scheme + "://" + p.netloc):
-        return _unsafe_httpdo(url, method, data, timeout)
-
-
-def _unsafe_httpdo(url: str, method='GET', data=None, timeout=None):
-    """
-    Do HTTP Request
-    """
-    start = time.time()
-    if DEBUG:
-        body = json.dumps(data) if data else ''
-        print("Shell$ curl -X {method} -d '{body}' '{url}'".format(
-            method=method.upper(), body=body or '', url=url))
-
-    if timeout is None:
-        timeout = HTTP_TIMEOUT
-    response = fetch(url, method, data, timeout)
-    if response.status_code == 502:  # Bad Gateway
-        raise exceptions.WDABadGateway(response.status_code, response.text)
-    if DEBUG:
-        ms = (time.time() - start) * 1000
-        response_text = response.text
-        if url.endswith("/screenshot"):
-            response_text = response_text[:100] + "..." # limit length of screenshot response
-        print('Return ({:.0f}ms): {}'.format(ms, response_text))
-
-    try:
-        retjson = response.json()
-        retjson['status'] = retjson.get('status', 0)
-        r = convert(retjson)
-
-        if isinstance(r.value, dict) and r.value.get("error"):
-            status = Status.ERROR
-            value = r.value.copy()
-            value.pop("traceback", None)
-
-            for errCls in (exceptions.WDAInvalidSessionIdError,
-                           exceptions.WDAPossiblyCrashedError,
-                           exceptions.WDAKeyboardNotPresentError,
-                           exceptions.WDAUnknownError,
-                           exceptions.WDAStaleElementReferenceError):
-                if errCls.check(value):
-                    raise errCls(status, value)
-            raise exceptions.WDARequestError(status, value)
-        return r
-    except exceptions.JSONDecodeError:
-        if response.text == "":
-            raise exceptions.WDAEmptyResponseError(method, url, data)
-        raise exceptions.WDAError(method, url, response.text[:100] + "...") # should not too long
-
 
 class Rect(list):
     def __init__(self, x, y, width, height):
@@ -288,47 +215,14 @@ class BaseClient(object):
 
         If target is empty, device url will set to env-var "DEVICE_URL" if defined else set to "http://localhost:8100"
         """
-        if not url:
-            url = os.environ.get('DEVICE_URL', 'http://localhost:8100')
-        assert re.match(r"^(http\+usbmux|https?)://", url), "Invalid URL: %r" % url
-
+        if not url.endswith("/"):
+            url += '/'
+        parsed = urlparse(url)
         # Session variable
-        self.__wda_url = url
+        self.__wda_url = parsed.geturl()
         self.__session_id = _session_id
-        self.__is_app = bool(_session_id)  # set to freeze session_id
         self.__timeout = 30.0
         self.__callbacks = defaultdict(list)
-        self.__callback_depth = 0
-        self.__callback_running = False
-
-        # u = urllib.parse.urlparse(self.__wda_url)
-        # if u.scheme == "http+usbmux" and not self.is_ready():
-        #     udid = u.netloc.split(":")[0]
-        #     if _start_wda_xctest(udid):
-        #         self.wait_ready()
-                # raise RuntimeError("xctest start failed")
-
-    def _callback_fix_invalid_session_id(self, err: exceptions.WDAError):
-        """ 当遇到 invalid session id错误时，更新session id并重试 """
-        if isinstance(err, exceptions.WDAInvalidSessionIdError):  # and not self.__is_app:
-            self.session_id = None
-            return Callback.RET_RETRY
-        if isinstance(err, exceptions.WDAPossiblyCrashedError):
-            self.session_id = self.session().session_id  # generate new sessionId
-            return Callback.RET_RETRY
-        """ 等待设备恢复上线 """
-
-    def _callback_json_report(self, method, urlpath):
-        """ TODO: ssx """
-        pass
-
-    def _set_output_report(self, filename: str):
-        """
-        Args:
-            filename: json log
-        """
-        self.register_callback(
-            Callback.HTTP_REQUEST_BEFORE, self._callback_json_report)
 
     def is_ready(self) -> bool:
         try:
@@ -368,8 +262,7 @@ class BaseClient(object):
         res["value"]['sessionId'] = res.get("sessionId")
         # Can't use res.value['sessionId'] = ...
         return res.value
-
-    @limit_call_depth(4)
+    
     def _fetch(self,
                method: str,
                urlpath: str,
@@ -377,18 +270,67 @@ class BaseClient(object):
                with_session: bool = False,
                timeout: Optional[float] = None) -> AttrDict:
         """ do http request """
-        urlpath = "/" + urlpath.lstrip("/")  # urlpath always startswith /
 
-        url = urljoin(self.__wda_url, urlpath)
+        if with_session:
+            url = urljoin(self.__wda_url, f"session/{self.session_id}/")
+            url = urljoin(url, urlpath)
+        else:
+            url = urljoin(self.__wda_url, urlpath)
+
+        # 构造 headers
+        headers = {"Content-Type": "application/json"} if data else {}
+
+        # 构造 json 参数
+        json_data = data if data else None
 
         try:
-            if with_session:
-                url = urljoin(self.__wda_url, "session", self.session_id,
-                              urlpath)
-            response = httpdo(url, method, data, timeout)
-            return response
-        except Exception as err:
-                raise err
+            resp = requests.request(
+                method.upper(),
+                url,
+                json=json_data,
+                headers=headers,
+                timeout=timeout
+            )
+        except requests.RequestException as e:
+            # 网络层异常统一转成 WDAError
+            raise exceptions.WDAError(method, url, str(e))
+
+        # 502 Bad Gateway
+        if resp.status_code == 502:
+            raise exceptions.WDABadGateway(resp.status_code, resp.text)
+
+        # 空 body
+        if not resp.text.strip():
+            raise exceptions.WDAEmptyResponseError(method, url, data)
+
+        # 解析 JSON
+        try:
+            retjson = resp.json()
+        except ValueError:
+            raise exceptions.WDAError(method, url, resp.text[:100] + "...")
+
+        retjson.setdefault("status", 0)
+        r = convert(retjson)
+
+        # 处理 WDA 返回的错误
+        if isinstance(r.value, dict) and r.value.get("error"):
+            status = Status.ERROR
+            value = r.value.copy()
+            value.pop("traceback", None)
+
+            for err_cls in (
+                exceptions.WDAInvalidSessionIdError,
+                exceptions.WDAPossiblyCrashedError,
+                exceptions.WDAKeyboardNotPresentError,
+                exceptions.WDAStaleElementReferenceError,
+                exceptions.WDAUnknownError,
+            ):
+                if err_cls.check(value):
+                    raise err_cls(status, value)
+
+            raise exceptions.WDARequestError(status, value)
+
+        return r
 
     @property
     def http(self):
@@ -408,7 +350,7 @@ class BaseClient(object):
     def home(self):
         """Press home button"""
         try:
-            self.http.post('/wda/homescreen')
+            self.http.post('wda/homescreen')
         except exceptions.WDARequestError as e:
             if "Timeout waiting until SpringBoard is visible" in str(e):
                 return
@@ -416,18 +358,18 @@ class BaseClient(object):
 
     def healthcheck(self):
         """Hit healthcheck"""
-        return self.http.get('/wda/healthcheck')
+        return self.http.get('wda/healthcheck')
 
     def locked(self) -> bool:
         """ returns locked status, true or false """
-        return self.http.get("/wda/locked").value
+        return self.http.get("wda/locked").value
 
     def lock(self):
-        return self.http.post('/wda/lock')
+        return self.http.post('wda/lock')
 
     def unlock(self):
         """ unlock screen, double press home """
-        return self.http.post('/wda/unlock')
+        return self.http.post('wda/unlock')
 
     def sleep(self, secs: float):
         """ same as time.sleep """
@@ -442,7 +384,7 @@ class BaseClient(object):
              "name": "",
              "bundleId": "com.netease.cloudmusic"}
         """
-        return self.http.get("/wda/activeAppInfo").value
+        return self.http.get("wda/activeAppInfo").value
 
     def source(self, format='xml', accessible=False):
         """
@@ -451,7 +393,7 @@ class BaseClient(object):
             accessible (bool): when set to true, format is always 'json'
         """
         if accessible:
-            return self.http.get('/wda/accessibleSource').value
+            return self.http.get('wda/accessibleSource').value
         return self.http.get('source?format=' + format).value
 
     def screenshot(self, png_filename=None, format='pillow'):
@@ -588,7 +530,7 @@ class BaseClient(object):
     def close(self):
         '''Close created session which session id saved in class ctx.'''
         try:
-            return self._session_http.delete('/')
+            return self._session_http.delete('')
         except exceptions.WDARequestError as e:
             if not isinstance(e, (exceptions.WDAInvalidSessionIdError, exceptions.WDAPossiblyCrashedError)):
                 raise
@@ -635,7 +577,7 @@ class BaseClient(object):
             self._session_http.get("/wda/screen").value returns {"statusBarSize": {'width': 320, 'height': 20}, 'scale': 2}
         """
         try:
-            return self._session_http.get("/wda/screen").value['scale']
+            return self._session_http.get("wda/screen").value['scale']
         except (KeyError, exceptions.WDARequestError):
             v = max(self.screenshot().size) / max(self.window_size())
             return round(v)
@@ -658,14 +600,14 @@ class BaseClient(object):
         Returns dict: (I do not known what it means)
             eg: {"level": 1, "state": 2}
         """
-        return self._session_http.get("/wda/batteryInfo").value
+        return self._session_http.get("wda/batteryInfo").value
 
     def device_info(self):
         """
         Returns dict:
             eg: {'currentLocale': 'zh_CN', 'timeZone': 'Asia/Shanghai'}
         """
-        return self._session_http.get("/wda/device/info").value
+        return self._session_http.get("wda/device/info").value
 
     @property
     def info(self):
@@ -685,7 +627,7 @@ class BaseClient(object):
     def set_clipboard(self, content, content_type="plaintext"):
         """ set clipboard """
         self._session_http.post(
-            "/wda/setPasteboard", {
+            "wda/setPasteboard", {
                 "content": base64.b64encode(content.encode()).decode(),
                 "contentType": content_type
             })
@@ -708,14 +650,13 @@ class BaseClient(object):
             self.app_launch(wda_bundle_id)
         except:
             pass
-        clipboard_text = self._session_http.post("/wda/getPasteboard").value
+        clipboard_text = self._session_http.post("wda/getPasteboard").value
         # Switch back to the screen before.
         self.app_launch(current_app_bundle_id)
         return base64.b64decode(clipboard_text).decode('utf-8')
     
-    # Not working
-    # def siri_activate(self, text):
-    #    self.http.post("/wda/siri/activate", {"text": text})
+    def siri_activate(self, text):
+       self._session_http.post("wda/siri/activate", {"text": text})
 
     def app_launch(self,
                    bundle_id,
@@ -738,7 +679,7 @@ class BaseClient(object):
             self.unlock()
 
         return self._session_http.post(
-            "/wda/apps/launch", {
+            "wda/apps/launch", {
                 "bundleId": bundle_id,
                 "arguments": arguments,
                 "environment": environment,
@@ -746,13 +687,13 @@ class BaseClient(object):
             })
 
     def app_activate(self, bundle_id):
-        return self._session_http.post("/wda/apps/launch", {
+        return self._session_http.post("wda/apps/launch", {
             "bundleId": bundle_id,
         })
 
     def app_terminate(self, bundle_id):
         # Deprecated, use app_stop instead
-        return self._session_http.post("/wda/apps/terminate", {
+        return self._session_http.post("wda/apps/terminate", {
             "bundleId": bundle_id,
         })
 
@@ -766,7 +707,7 @@ class BaseClient(object):
 
         value 1(not running) 2(running in background) 3(running in foreground)
         """
-        return self._session_http.post("/wda/apps/state", {
+        return self._session_http.post("wda/apps/state", {
             "bundleId": bundle_id,
         })
 
@@ -793,7 +734,7 @@ class BaseClient(object):
         Return example:
             [{'pid': 52, 'bundleId': 'com.apple.springboard'}]
         """
-        return self._session_http.get("/wda/apps/list").value
+        return self._session_http.get("wda/apps/list").value
 
     def open_url(self, url):
         """
@@ -814,16 +755,16 @@ class BaseClient(object):
         Args:
             - duration (float): deactivate time, seconds
         """
-        return self._session_http.post('/wda/deactivateApp',
+        return self._session_http.post('wda/deactivateApp',
                                        dict(duration=duration))
 
     def tap(self, x, y):
         # Support WDA `BREAKING CHANGES`
         # More see: https://github.com/appium/WebDriverAgent/blob/master/CHANGELOG.md#600-2024-01-31
         try:
-            return self._session_http.post('/wda/tap', dict(x=x, y=y))
+            return self._session_http.post('wda/tap', dict(x=x, y=y))
         except:
-            return self._session_http.post('/wda/tap/0', dict(x=x, y=y))
+            return self._session_http.post('wda/tap/0', dict(x=x, y=y))
 
     def _percent2pos(self, x, y, window_size=None):
         if any(isinstance(v, float) for v in [x, y]):
@@ -849,7 +790,7 @@ class BaseClient(object):
 
     def double_tap(self, x, y):
         x, y = self._percent2pos(x, y)
-        return self._session_http.post('/wda/doubleTap', dict(x=x, y=y))
+        return self._session_http.post('wda/doubleTap', dict(x=x, y=y))
 
     def tap_hold(self, x, y, duration=1.0):
         """
@@ -863,7 +804,7 @@ class BaseClient(object):
         """
         x, y = self._percent2pos(x, y)
         data = {'x': x, 'y': y, 'duration': duration}
-        return self._session_http.post('/wda/touchAndHold', data=data)
+        return self._session_http.post('wda/touchAndHold', data=data)
 
     def swipe(self, x1, y1, x2, y2, duration=0):
         """
@@ -879,14 +820,14 @@ class BaseClient(object):
             x2, y2 = self._percent2pos(x2, y2, size)
 
         data = dict(fromX=x1, fromY=y1, toX=x2, toY=y2, duration=duration)
-        return self._session_http.post('/wda/dragfromtoforduration', data=data)
+        return self._session_http.post('wda/dragfromtoforduration', data=data)
 
     def _fast_swipe(self, x1, y1, x2, y2, velocity: int = 500):
         """
         velocity: the larger the faster
         """
         data = dict(fromX=x1, fromY=y1, toX=x2, toY=y2, velocity=velocity)
-        return self._session_http.post('/wda/drag', data=data)
+        return self._session_http.post('wda/drag', data=data)
 
     def swipe_left(self):
         """ swipe right to left """
@@ -970,7 +911,7 @@ class BaseClient(object):
         """
         returns (width, height) might be (0, 0)
         """
-        value = self._session_http.get('/window/size').value
+        value = self._session_http.get('window/size').value
         w = roundint(value['width'])
         h = roundint(value['height'])
         return namedtuple('Size', ['width', 'height'])(w, h)
@@ -982,7 +923,7 @@ class BaseClient(object):
         """
         if isinstance(value, str):
             value = list(value)
-        return self._session_http.post('/wda/keys', data={'value': value})
+        return self._session_http.post('wda/keys', data={'value': value})
 
     def press(self, name: str):
         """
@@ -993,7 +934,7 @@ class BaseClient(object):
         if name not in valid_names:
             raise ValueError(
                 f"Invalid name: {name}, should be one of {valid_names}")
-        self._session_http.post("/wda/pressButton", {"name": name})
+        self._session_http.post("wda/pressButton", {"name": name})
 
     def press_duration(self, name: str, duration: float):
         """
@@ -1022,14 +963,14 @@ class BaseClient(object):
         if name not in hid_usages:
             raise ValueError("Invalid name:", name)
         hid_usage = hid_usages[name]
-        return self._session_http.post("/wda/performIoHidEvent", {"page": 0x0C, "usage": hid_usage, "duration": duration})
+        return self._session_http.post("wda/performIoHidEvent", {"page": 0x0C, "usage": hid_usage, "duration": duration})
 
     def keyboard_dismiss(self):
         """
         Not working for now
         """
         raise RuntimeError("not pass tests, this method is not allowed to use")
-        self._session_http.post('/wda/keyboard/dismiss')
+        self._session_http.post('wda/keyboard/dismiss')
 
     def appium_settings(self, value: Optional[dict] = None) -> dict:
         """
@@ -1094,7 +1035,7 @@ class Alert(object):
 
     @property
     def text(self):
-        return self.http.get('/alert/text').value
+        return self.http.get('alert/text').value
     
     def set_text(self, text: str):
         '''Set text to alert.
@@ -1104,7 +1045,7 @@ class Alert(object):
             value={'error': 'no such alert', 'message': 'An attempt was 
             made to operate on a modal dialog when one was not open'})```
         '''
-        return self.http.post('/alert/text', data={'value': text})
+        return self.http.post('alert/text', data={'value': text})
 
     def wait(self, timeout=20.0):
         start_time = time.time()
@@ -1115,13 +1056,13 @@ class Alert(object):
         return False
 
     def accept(self):
-        return self.http.post('/alert/accept')
+        return self.http.post('alert/accept')
 
     def dismiss(self):
-        return self.http.post('/alert/dismiss')
+        return self.http.post('alert/dismiss')
 
     def buttons(self):
-        return self.http.get('/wda/alert/buttons').value
+        return self.http.get('wda/alert/buttons').value
 
     def click(self, button_name: Optional[Union[str, list]] = None):
         """
@@ -1136,7 +1077,7 @@ class Alert(object):
         """
         # Actually, It has no difference POST to accept or dismiss
         if isinstance(button_name, str):
-            self.http.post('/alert/accept', data={"name": button_name})
+            self.http.post('alert/accept', data={"name": button_name})
             return button_name
 
         avaliable_names = self.buttons()
@@ -1353,7 +1294,7 @@ class Selector(object):
         ]
         """
         element_ids = []
-        for v in self.http.post('/elements', {
+        for v in self.http.post('elements', {
                 'using': using,
                 'value': value
         }).value:
@@ -1566,16 +1507,16 @@ class Element(object):
         return self._session._session_http
 
     def _req(self, method, url, data=None):
-        return self.http.fetch(method, '/element/' + self._id + url, data)
+        return self.http.fetch(method, 'element/' + self._id + url, data)
 
     def _wda_req(self, method, url, data=None):
-        return self.http.fetch(method, '/wda/element/' + self._id + url, data)
+        return self.http.fetch(method, 'wda/element/' + self._id + url, data)
 
     def _prop(self, key):
         return self._req('GET', '/' + key.lstrip('/')).value
 
     def _wda_prop(self, key):
-        ret = self.http.get('/wda/element/%s/%s' % (self._id, key)).value
+        ret = self.http.get('wda/element/%s/%s' % (self._id, key)).value
         return ret
 
     @property
