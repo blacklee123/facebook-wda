@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from collections import defaultdict, namedtuple
-from typing import Optional, Union, Callable, Dict
+from typing import Optional, Union, Callable, Dict, NamedTuple
 from urllib.parse import urlparse, urljoin
 import requests
 
@@ -160,7 +160,10 @@ class HTTPRequest(NamedTuple):
     get: Callable[[str, Optional[Dict], Optional[float]], AttrDict]
     post: Callable[[str, Optional[Dict], Optional[float]], AttrDict]
 
-class HTTPSessionRequest(HTTPRequest):
+class HTTPSessionRequest(NamedTuple):
+    fetch: Callable[..., AttrDict]
+    get: Callable[[str, Optional[Dict], Optional[float]], AttrDict]
+    post: Callable[[str, Optional[Dict], Optional[float]], AttrDict]
     delete: Callable[[str, Optional[Dict], Optional[float]], AttrDict]
 
 class BaseClient():
