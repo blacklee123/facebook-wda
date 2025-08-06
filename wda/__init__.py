@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from collections import defaultdict, namedtuple
-from typing import Optional, Union
+from typing import Optional, Union, Callable, Dict
 from urllib.parse import urlparse, urljoin
 import requests
 
@@ -155,6 +155,13 @@ class Callback(str, enum.Enum):
 def roundint(i):
     return int(round(i, 0))
 
+class HTTPRequest(NamedTuple):
+    fetch: Callable[..., AttrDict]
+    get: Callable[[str, Optional[Dict], Optional[float]], AttrDict]
+    post: Callable[[str, Optional[Dict], Optional[float]], AttrDict]
+
+class HTTPSessionRequest(HTTPRequest):
+    delete: Callable[[str, Optional[Dict], Optional[float]], AttrDict]
 
 class BaseClient():
     def __init__(self, url=None, _session_id=None):
@@ -282,21 +289,21 @@ class BaseClient():
         return r
 
     @property
-    def http(self):
-        return namedtuple("HTTPRequest", ['fetch', 'get', 'post'])(
+    def http(self) -> HTTPRequest:
+        return HTTPRequest(
             self._fetch,
             functools.partial(self._fetch, "GET"),
             functools.partial(self._fetch, "POST"))  # yapf: disable
 
     @property
-    def _session_http(self):
-        return namedtuple("HTTPSessionRequest", ['fetch', 'get', 'post', 'delete'])(
+    def _session_http(self) -> HTTPSessionRequest:
+        return HTTPSessionRequest(
             functools.partial(self._fetch, with_session=True),
             functools.partial(self._fetch, "GET", with_session=True),
             functools.partial(self._fetch, "POST", with_session=True),
             functools.partial(self._fetch, "DELETE", with_session=True))  # yapf: disable
 
-    def home(self):
+    def home(self) -> Optional[AttrDict]:
         """Press home button"""
         try:
             self.http.post('wda/homescreen')
