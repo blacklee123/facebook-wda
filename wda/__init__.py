@@ -301,9 +301,6 @@ class BaseClient(object):
         self.__callback_depth = 0
         self.__callback_running = False
 
-        if not _session_id:
-            self._init_callback()
-
         # u = urllib.parse.urlparse(self.__wda_url)
         # if u.scheme == "http+usbmux" and not self.is_ready():
         #     udid = u.netloc.split(":")[0]
@@ -320,10 +317,6 @@ class BaseClient(object):
             self.session_id = self.session().session_id  # generate new sessionId
             return Callback.RET_RETRY
         """ 等待设备恢复上线 """
-
-    def _init_callback(self):
-        self.register_callback(Callback.ERROR,
-                               self._callback_fix_invalid_session_id)
 
     def _callback_json_report(self, method, urlpath):
         """ TODO: ssx """
@@ -376,45 +369,6 @@ class BaseClient(object):
         # Can't use res.value['sessionId'] = ...
         return res.value
 
-    def register_callback(self, event_name: str, func: Callable, try_first: bool = False):
-        if try_first:
-            self.__callbacks[event_name].insert(0, func)
-        else:
-            self.__callbacks[event_name].append(func)
-
-    def unregister_callback(self,
-                            event_name: Optional[str] = None,
-                            func: Optional[Callable] = None):
-        """ 反注册 """
-        if event_name is None:
-            self.__callbacks.clear()
-        elif func is None:
-            self.__callbacks[event_name].clear()
-        else:
-            self.__callbacks[event_name].remove(func)
-
-    def _run_callback(self, event_name, callbacks,
-                      **kwargs) -> Union[None, Callback]:
-        """ 运行回调函数 """
-        if not callbacks:
-            return
-
-        self.__callback_running = True
-        try:
-            for fn in callbacks[event_name]:
-                ret = inject_call(fn, **kwargs)
-                if ret in [
-                        Callback.RET_RETRY, Callback.RET_ABORT,
-                        Callback.RET_CONTINUE
-                ]:
-                    return ret
-        finally:
-            self.__callback_running = False
-
-    @property
-    def callbacks(self):
-        return self.__callbacks
-
     @limit_call_depth(4)
     def _fetch(self,
                method: str,
@@ -425,38 +379,16 @@ class BaseClient(object):
         """ do http request """
         urlpath = "/" + urlpath.lstrip("/")  # urlpath always startswith /
 
-        callbacks = self.__callbacks
-
-        if self.__callback_running:
-            callbacks = None
-
         url = urljoin(self.__wda_url, urlpath)
-
-        run_callback = functools.partial(self._run_callback,
-                                         callbacks=callbacks,
-                                         method=method,
-                                         url=url,
-                                         urlpath=urlpath,
-                                         with_session=with_session,
-                                         data=data,
-                                         client=self)
 
         try:
             if with_session:
                 url = urljoin(self.__wda_url, "session", self.session_id,
                               urlpath)
-            run_callback(Callback.HTTP_REQUEST_BEFORE)
             response = httpdo(url, method, data, timeout)
-            run_callback(Callback.HTTP_REQUEST_AFTER, response=response)
             return response
         except Exception as err:
-            ret = run_callback(Callback.ERROR, err=err)
-            if ret == Callback.RET_RETRY:
-                return self._fetch(method, urlpath, data, with_session)
-            elif ret == Callback.RET_CONTINUE:
-                return
-            else:
-                raise
+                raise err
 
     @property
     def http(self):

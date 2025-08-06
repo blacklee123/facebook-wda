@@ -8,18 +8,13 @@ import json
 from http.client import HTTPConnection, HTTPSConnection, HTTPResponse
 from urllib.parse import urlparse
 
-from wda.usbmux.exceptions import HTTPError, MuxConnectError, MuxError
-from wda.usbmux.pyusbmux import select_device
+from wda.usbmux.exceptions import HTTPError
 
 _DEFAULT_CHUNK_SIZE = 4096
 
 def http_create(url: str) -> HTTPConnection:
     u = urlparse(url)
-    if u.scheme == "http+usbmux":
-        udid, device_wda_port = u.netloc.split(":")
-        device = select_device(udid)
-        return device.make_http_connection(int(device_wda_port))
-    elif u.scheme == "http":
+    if u.scheme == "http":
         return HTTPConnection(u.netloc)
     elif u.scheme == "https":
         return HTTPSConnection(u.netloc)
