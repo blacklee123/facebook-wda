@@ -1,19 +1,8 @@
-# coding: utf-8
-# author: codeskyblue
-
 import json
 
 
 JSONDecodeError = json.decoder.JSONDecodeError if hasattr(
     json.decoder, "JSONDecodeError") else ValueError
-
-
-class MuxError(Exception):
-    """ Mutex error """
-
-
-class MuxConnectError(MuxError, ConnectionError):
-    """ Error when MessageType: Connect """
 
 
 class WDAError(Exception):

@@ -1,6 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
 import base64
 import contextlib
 import enum
@@ -10,8 +7,6 @@ import json
 import logging
 import os
 import re
-import shutil
-import subprocess
 import threading
 import time
 from collections import defaultdict, namedtuple
@@ -20,7 +15,7 @@ from urllib.parse import urlparse
 
 import retry
 
-from wda.exceptions import *
+from wda import exceptions
 from wda.usbmux import fetch
 from wda.utils import inject_call, limit_call_depth, AttrDict, convert
 
@@ -210,7 +205,7 @@ def _unsafe_httpdo(url: str, method='GET', data=None, timeout=None):
         timeout = HTTP_TIMEOUT
     response = fetch(url, method, data, timeout)
     if response.status_code == 502:  # Bad Gateway
-        raise WDABadGateway(response.status_code, response.text)
+        raise exceptions.WDABadGateway(response.status_code, response.text)
     if DEBUG:
         ms = (time.time() - start) * 1000
         response_text = response.text
@@ -228,15 +223,19 @@ def _unsafe_httpdo(url: str, method='GET', data=None, timeout=None):
             value = r.value.copy()
             value.pop("traceback", None)
 
-            for errCls in (WDAInvalidSessionIdError, WDAPossiblyCrashedError, WDAKeyboardNotPresentError, WDAUnknownError, WDAStaleElementReferenceError):
+            for errCls in (exceptions.WDAInvalidSessionIdError,
+                           exceptions.WDAPossiblyCrashedError,
+                           exceptions.WDAKeyboardNotPresentError,
+                           exceptions.WDAUnknownError,
+                           exceptions.WDAStaleElementReferenceError):
                 if errCls.check(value):
                     raise errCls(status, value)
-            raise WDARequestError(status, value)
+            raise exceptions.WDARequestError(status, value)
         return r
-    except JSONDecodeError:
+    except exceptions.JSONDecodeError:
         if response.text == "":
-            raise WDAEmptyResponseError(method, url, data)
-        raise WDAError(method, url, response.text[:100] + "...") # should not too long
+            raise exceptions.WDAEmptyResponseError(method, url, data)
+        raise exceptions.WDAError(method, url, response.text[:100] + "...") # should not too long
 
 
 class Rect(list):
@@ -312,12 +311,12 @@ class BaseClient(object):
         #         self.wait_ready()
                 # raise RuntimeError("xctest start failed")
 
-    def _callback_fix_invalid_session_id(self, err: WDAError):
+    def _callback_fix_invalid_session_id(self, err: exceptions.WDAError):
         """ 当遇到 invalid session id错误时，更新session id并重试 """
-        if isinstance(err, WDAInvalidSessionIdError):  # and not self.__is_app:
+        if isinstance(err, exceptions.WDAInvalidSessionIdError):  # and not self.__is_app:
             self.session_id = None
             return Callback.RET_RETRY
-        if isinstance(err, WDAPossiblyCrashedError):
+        if isinstance(err, exceptions.WDAPossiblyCrashedError):
             self.session_id = self.session().session_id  # generate new sessionId
             return Callback.RET_RETRY
         """ 等待设备恢复上线 """
@@ -370,7 +369,7 @@ class BaseClient(object):
         _dprint("device still offline")
         return False
 
-    @retry.retry(exceptions=WDAEmptyResponseError, tries=3, delay=2)
+    @retry.retry(exceptions=exceptions.WDAEmptyResponseError, tries=3, delay=2)
     def status(self):
         res = self.http.get('status')
         res["value"]['sessionId'] = res.get("sessionId")
@@ -478,7 +477,7 @@ class BaseClient(object):
         """Press home button"""
         try:
             self.http.post('/wda/homescreen')
-        except WDARequestError as e:
+        except exceptions.WDARequestError as e:
             if "Timeout waiting until SpringBoard is visible" in str(e):
                 return
             raise
@@ -502,7 +501,7 @@ class BaseClient(object):
         """ same as time.sleep """
         time.sleep(secs)
 
-    @retry.retry(WDAUnknownError, tries=3, delay=.5, jitter=.2)
+    @retry.retry(exceptions.WDAUnknownError, tries=3, delay=.5, jitter=.2)
     def app_current(self) -> dict:
         """
         Returns:
@@ -541,7 +540,7 @@ class BaseClient(object):
         raw_value = base64.b64decode(value)
         png_header = b"\x89PNG\r\n\x1a\n"
         if not raw_value.startswith(png_header) and png_filename:
-            raise WDARequestError(-1, "screenshot png format error")
+            raise exceptions.WDARequestError(-1, "screenshot png format error")
 
         if png_filename:
             with open(png_filename, 'wb') as f:
@@ -637,7 +636,7 @@ class BaseClient(object):
             self.unlock()
         try:
             res = self.http.post('session', payload)
-        except WDAEmptyResponseError:
+        except exceptions.WDAEmptyResponseError:
             """ when there is alert, might be got empty response
             use /wda/apps/state may still get sessionId
             """
@@ -658,8 +657,8 @@ class BaseClient(object):
         '''Close created session which session id saved in class ctx.'''
         try:
             return self._session_http.delete('/')
-        except WDARequestError as e:
-            if not isinstance(e, (WDAInvalidSessionIdError, WDAPossiblyCrashedError)):
+        except exceptions.WDARequestError as e:
+            if not isinstance(e, (exceptions.WDAInvalidSessionIdError, exceptions.WDAPossiblyCrashedError)):
                 raise
 
     #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@#
@@ -705,7 +704,7 @@ class BaseClient(object):
         """
         try:
             return self._session_http.get("/wda/screen").value['scale']
-        except (KeyError, WDARequestError):
+        except (KeyError, exceptions.WDARequestError):
             v = max(self.screenshot().size) / max(self.window_size())
             return round(v)
 
@@ -1044,7 +1043,7 @@ class BaseClient(object):
         h = roundint(value['height'])
         return namedtuple('Size', ['width', 'height'])(w, h)
 
-    @retry.retry(WDAKeyboardNotPresentError, tries=3, delay=1.0)
+    @retry.retry(exceptions.WDAKeyboardNotPresentError, tries=3, delay=1.0)
     def send_keys(self, value):
         """
         send keys, yet I know not, todo function
@@ -1157,7 +1156,7 @@ class Alert(object):
         try:
             self.text
             return True
-        except WDARequestError as e:
+        except exceptions.WDARequestError as e:
             # expect e.status != 27 in old version and e.value == 'no such alert' in new version
             return False
 
@@ -1225,7 +1224,7 @@ class Alert(object):
         """
         try:
             return self.click(buttons)
-        except (ValueError, WDARequestError):
+        except (ValueError, exceptions.WDARequestError):
             return None
 
     @contextlib.contextmanager
@@ -1254,7 +1253,7 @@ class Alert(object):
                             break
                     else:
                         logger.warning("Alert not handled")
-                except WDARequestError:
+                except exceptions.WDARequestError:
                     pass
                 time.sleep(interval)
 
@@ -1460,7 +1459,7 @@ class Selector(object):
             chain = chain + '[%d]' % self._index
         return chain
 
-    @retry.retry(WDAStaleElementReferenceError, tries=3, delay=.5, jitter=.2)
+    @retry.retry(exceptions.WDAStaleElementReferenceError, tries=3, delay=.5, jitter=.2)
     def find_element_ids(self):
         elems = []
         if self._id:
@@ -1517,7 +1516,7 @@ class Selector(object):
             time.sleep(0.5)
 
         if raise_error:
-            raise WDAElementNotFoundError("element not found",
+            raise exceptions.WDAElementNotFoundError("element not found",
                                           "timeout %.1f" % timeout)
 
     def __getattr__(self, oper):
@@ -1606,7 +1605,7 @@ class Selector(object):
                 return True
         if not raise_error:
             return False
-        raise WDAElementNotDisappearError("element not gone")
+        raise exceptions.WDAElementNotDisappearError("element not gone")
 
     # todo
     # pinch
